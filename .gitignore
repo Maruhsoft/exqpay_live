@@ -1,0 +1,33 @@
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Dependencies
+vendor/
+composer.lock
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Logs
+logs/
+*.log
+
+# Uploads
+uploads/
+temp/
+cache/
+
+# Database
+*.sqlite
+*.db
+
+# Sensitive
+.env.secrets
+private_keys/
