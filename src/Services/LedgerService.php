@@ -1,226 +1,221 @@
 <?php
 /**
- * Double-Entry Ledger System
- * Core financial accounting ensuring financial correctness
+ * Enhanced Ledger Service with Financial Transactions
  */
 
 namespace Exqpay\Services;
 
-use Exqpay\Core\Database;
-use Exqpay\Core\Logger;
+use Exqpay\Core\BaseService;
+use Exqpay\Core\Exception\ExqpayException;
 
-class LedgerService
+class LedgerService extends BaseService
 {
     // Transaction types
-    public const TRANSACTION_TYPE_DEPOSIT = 'deposit';
-    public const TRANSACTION_TYPE_WITHDRAWAL = 'withdrawal';
-    public const TRANSACTION_TYPE_CONVERSION = 'conversion';
-    public const TRANSACTION_TYPE_GIFT_CARD_PURCHASE = 'gift_card_purchase';
-    public const TRANSACTION_TYPE_FEE = 'fee';
-    public const TRANSACTION_TYPE_REFUND = 'refund';
+    public const TYPE_DEPOSIT = 'deposit';
+    public const TYPE_WITHDRAWAL = 'withdrawal';
+    public const TYPE_CONVERSION = 'conversion';
+    public const TYPE_GIFT_CARD = 'gift_card';
+    public const TYPE_FEE = 'fee';
+    public const TYPE_REFUND = 'refund';
 
     // Status values
     public const STATUS_PENDING = 'pending';
     public const STATUS_CONFIRMED = 'confirmed';
-    public const STATUS_REVERSED = 'reversed';
     public const STATUS_FAILED = 'failed';
+    public const STATUS_REVERSED = 'reversed';
 
-    /**
-     * Record a debit transaction (money in)
-     */
-    public static function recordDebit(
-        string $userId,
-        string $currency,
-        string $amount,
-        string $transactionType,
-        string $idempotencyKey,
-        array $metadata = []
-    ): array {
-        return self::recordTransaction($userId, $currency, $amount, 'debit', $transactionType, $idempotencyKey, $metadata);
+    private WalletService $walletService;
+
+    public function __construct()
+    {
+        parent::__construct();
+        $this->walletService = new WalletService();
     }
 
     /**
-     * Record a credit transaction (money out)
+     * Record transaction (append-only)
      */
-    public static function recordCredit(
+    public function record(
         string $userId,
         string $currency,
         string $amount,
-        string $transactionType,
+        string $type,
         string $idempotencyKey,
         array $metadata = []
     ): array {
-        return self::recordTransaction($userId, $currency, $amount, 'credit', $transactionType, $idempotencyKey, $metadata);
-    }
+        // Check for idempotency
+        $existing = $this->getByIdempotencyKey($idempotencyKey);
+        if ($existing) {
+            $this->log('Duplicate transaction detected', ['idempotency_key' => $idempotencyKey]);
+            return $existing;
+        }
 
-    /**
-     * Core transaction recording with idempotency
-     */
-    private static function recordTransaction(
-        string $userId,
-        string $currency,
-        string $amount,
-        string $direction,
-        string $transactionType,
-        string $idempotencyKey,
-        array $metadata = []
-    ): array {
-        $pdo = Database::connection();
+        $transactionId = $this->generateId('txn');
+        $direction = in_array($type, ['deposit', 'refund']) ? 'debit' : 'credit';
+
+        $this->db->beginTransaction();
 
         try {
-            Database::beginTransaction();
-
-            // Check for duplicate (idempotency)
-            $existing = $pdo->prepare('SELECT id, transaction_id FROM ledger_transactions WHERE idempotency_key = ?');
-            $existing->execute([$idempotencyKey]);
-            $existingRecord = $existing->fetch();
-
-            if ($existingRecord) {
-                Database::commit();
-                Logger::warning('Duplicate transaction', ['idempotency_key' => $idempotencyKey]);
-                return self::getTransaction($existingRecord['transaction_id']);
-            }
-
-            $transactionId = self::generateTransactionId();
-            self::ensureWallet($userId, $currency);
-
-            // Insert immutable ledger entry
-            $stmt = $pdo->prepare(
-                'INSERT INTO ledger_transactions (transaction_id, user_id, currency, amount, direction, transaction_type, idempotency_key, status, metadata, created_at, updated_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())'
+            // Insert into immutable ledger
+            $stmt = $this->db->prepare(
+                'INSERT INTO ledger_transactions (transaction_id, user_id, currency, amount, direction, transaction_type, idempotency_key, status, metadata, created_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())'
             );
             $stmt->execute([
-                $transactionId, $userId, $currency, $amount, $direction,
-                $transactionType, $idempotencyKey, self::STATUS_PENDING, json_encode($metadata),
+                $transactionId,
+                $userId,
+                $currency,
+                $amount,
+                $direction,
+                $type,
+                $idempotencyKey,
+                self::STATUS_PENDING,
+                json_encode($metadata),
             ]);
 
-            // Update balance
+            // Update wallet
             if ($direction === 'debit') {
-                self::updateBalance($userId, $currency, $amount, 'add');
+                $this->walletService->updateBalance($userId, $currency, $amount, 'available');
             } else {
-                self::updateBalance($userId, $currency, $amount, 'subtract');
+                $pendingAmount = '-' . $amount;
+                $this->walletService->updateBalance($userId, $currency, $pendingAmount, 'available');
             }
 
-            Database::commit();
-            Logger::audit('ledger_transaction_recorded', ['transaction_id' => $transactionId, 'user_id' => $userId]);
+            $this->db->commit();
+            $this->audit('TRANSACTION_RECORDED', [
+                'transaction_id' => $transactionId,
+                'user_id' => $userId,
+                'currency' => $currency,
+                'amount' => $amount,
+                'type' => $type,
+            ]);
 
-            return self::getTransaction($transactionId);
+            return $this->getById($transactionId);
         } catch (\Exception $e) {
-            Database::rollback();
-            Logger::error('Ledger transaction failed', ['error' => $e->getMessage()]);
+            $this->db->rollBack();
+            $this->log('Transaction recording failed', ['error' => $e->getMessage()], 'error');
             throw $e;
         }
     }
 
     /**
-     * Get current balance for user
+     * Get transaction by ID
      */
-    public static function getBalance(string $userId, string $currency = null): array
+    public function getById(string $transactionId): ?array
     {
-        $pdo = Database::connection();
-
-        if ($currency) {
-            $stmt = $pdo->prepare('SELECT currency, available_balance, pending_balance, locked_balance, total_balance FROM user_wallets WHERE user_id = ? AND currency = ?');
-            $stmt->execute([$userId, strtoupper($currency)]);
-            $wallet = $stmt->fetch();
-            return $wallet ?: ['currency' => strtoupper($currency), 'available_balance' => '0', 'pending_balance' => '0', 'locked_balance' => '0', 'total_balance' => '0'];
-        }
-
-        $stmt = $pdo->prepare('SELECT currency, available_balance, pending_balance, locked_balance, total_balance FROM user_wallets WHERE user_id = ? ORDER BY currency');
-        $stmt->execute([$userId]);
-        return $stmt->fetchAll();
-    }
-
-    /**
-     * Update wallet balance
-     */
-    private static function updateBalance(string $userId, string $currency, string $amount, string $operation = 'add'): void
-    {
-        $pdo = Database::connection();
-        $currency = strtoupper($currency);
-
-        if ($operation === 'add') {
-            $stmt = $pdo->prepare('UPDATE user_wallets SET available_balance = available_balance + ?, total_balance = total_balance + ?, updated_at = NOW() WHERE user_id = ? AND currency = ?');
-        } else {
-            $stmt = $pdo->prepare('UPDATE user_wallets SET available_balance = available_balance - ?, total_balance = total_balance - ?, updated_at = NOW() WHERE user_id = ? AND currency = ?');
-        }
-
-        $stmt->execute([$amount, $amount, $userId, $currency]);
-    }
-
-    /**
-     * Get transaction details
-     */
-    public static function getTransaction(string $transactionId): array
-    {
-        $pdo = Database::connection();
-        $stmt = $pdo->prepare('SELECT * FROM ledger_transactions WHERE transaction_id = ?');
+        $stmt = $this->db->prepare(
+            'SELECT * FROM ledger_transactions WHERE transaction_id = ?'
+        );
         $stmt->execute([$transactionId]);
-        $transaction = $stmt->fetch();
+        return $stmt->fetch();
+    }
 
-        if (!$transaction) {
-            throw new \RuntimeException('Transaction not found: ' . $transactionId);
+    /**
+     * Get transaction by idempotency key
+     */
+    public function getByIdempotencyKey(string $key): ?array
+    {
+        $stmt = $this->db->prepare(
+            'SELECT * FROM ledger_transactions WHERE idempotency_key = ?'
+        );
+        $stmt->execute([$key]);
+        return $stmt->fetch();
+    }
+
+    /**
+     * Confirm transaction
+     */
+    public function confirm(string $transactionId): void
+    {
+        $stmt = $this->db->prepare(
+            'UPDATE ledger_transactions SET status = ?, updated_at = NOW() WHERE transaction_id = ?'
+        );
+        $stmt->execute([self::STATUS_CONFIRMED, $transactionId]);
+        $this->audit('TRANSACTION_CONFIRMED', ['transaction_id' => $transactionId]);
+    }
+
+    /**
+     * Fail transaction
+     */
+    public function fail(string $transactionId): void
+    {
+        $stmt = $this->db->prepare(
+            'UPDATE ledger_transactions SET status = ?, updated_at = NOW() WHERE transaction_id = ?'
+        );
+        $stmt->execute([self::STATUS_FAILED, $transactionId]);
+        $this->audit('TRANSACTION_FAILED', ['transaction_id' => $transactionId]);
+    }
+
+    /**
+     * Reverse transaction
+     */
+    public function reverse(string $transactionId, string $reason = ''): void
+    {
+        $txn = $this->getById($transactionId);
+
+        if (!$txn) {
+            throw new ExqpayException('Transaction not found', 0, 404);
         }
 
-        if ($transaction['metadata']) {
-            $transaction['metadata'] = json_decode($transaction['metadata'], true);
-        }
+        $this->db->beginTransaction();
 
-        return $transaction;
+        try {
+            // Mark original as reversed
+            $stmt = $this->db->prepare(
+                'UPDATE ledger_transactions SET status = ?, updated_at = NOW() WHERE transaction_id = ?'
+            );
+            $stmt->execute([self::STATUS_REVERSED, $transactionId]);
+
+            // Create reversal transaction
+            $reversalId = $this->generateId('rev');
+            $reversalAmount = $txn['direction'] === 'debit' ? '-' . $txn['amount'] : $txn['amount'];
+
+            $stmt = $this->db->prepare(
+                'INSERT INTO ledger_transactions (transaction_id, user_id, currency, amount, direction, transaction_type, idempotency_key, status, metadata, created_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())'
+            );
+            $stmt->execute([
+                $reversalId,
+                $txn['user_id'],
+                $txn['currency'],
+                abs($reversalAmount),
+                $txn['direction'] === 'debit' ? 'credit' : 'debit',
+                'reversal',
+                'rev_' . $transactionId . '_' . time(),
+                self::STATUS_CONFIRMED,
+                json_encode(['reason' => $reason, 'original_transaction' => $transactionId]),
+            ]);
+
+            $this->db->commit();
+            $this->audit('TRANSACTION_REVERSED', [
+                'transaction_id' => $transactionId,
+                'reversal_id' => $reversalId,
+                'reason' => $reason,
+            ]);
+        } catch (\Exception $e) {
+            $this->db->rollBack();
+            throw $e;
+        }
     }
 
     /**
      * Get transaction history
      */
-    public static function getTransactionHistory(string $userId, string $currency = null, int $limit = 50, int $offset = 0): array
+    public function getHistory(string $userId, string $currency = null, int $limit = 50): array
     {
-        $pdo = Database::connection();
         $query = 'SELECT * FROM ledger_transactions WHERE user_id = ?';
         $params = [$userId];
 
         if ($currency) {
             $query .= ' AND currency = ?';
-            $params[] = strtoupper($currency);
+            $params[] = $currency;
         }
 
-        $query .= ' ORDER BY created_at DESC LIMIT ? OFFSET ?';
+        $query .= ' ORDER BY created_at DESC LIMIT ?';
         $params[] = $limit;
-        $params[] = $offset;
 
-        $stmt = $pdo->prepare($query);
+        $stmt = $this->db->prepare($query);
         $stmt->execute($params);
-        $transactions = $stmt->fetchAll();
-
-        foreach ($transactions as &$tx) {
-            if ($tx['metadata']) {
-                $tx['metadata'] = json_decode($tx['metadata'], true);
-            }
-        }
-
-        return $transactions;
-    }
-
-    /**
-     * Ensure wallet exists
-     */
-    private static function ensureWallet(string $userId, string $currency): void
-    {
-        $pdo = Database::connection();
-        $currency = strtoupper($currency);
-        $stmt = $pdo->prepare('SELECT id FROM user_wallets WHERE user_id = ? AND currency = ?');
-        $stmt->execute([$userId, $currency]);
-
-        if (!$stmt->fetch()) {
-            $stmt = $pdo->prepare('INSERT INTO user_wallets (user_id, currency, available_balance, pending_balance, locked_balance, total_balance, created_at, updated_at) VALUES (?, ?, "0", "0", "0", "0", NOW(), NOW())');
-            $stmt->execute([$userId, $currency]);
-        }
-    }
-
-    /**
-     * Generate unique transaction ID
-     */
-    private static function generateTransactionId(): string
-    {
-        return 'TXN_' . date('Ymd') . '_' . strtoupper(bin2hex(random_bytes(8)));
+        return $stmt->fetchAll();
     }
 }
